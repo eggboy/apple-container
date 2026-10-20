@@ -67,6 +67,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n $IMAGE ]] || { usage >&2; exit 1; }
+[[ -z $PLATFORM || $PLATFORM == */* ]] || die "--platform expects OS/ARCH, got '$PLATFORM'"
 APP_DIR=$(cd "$APP_DIR" 2>/dev/null && pwd -P) || die "app directory not found: $APP_DIR"
 command -v container >/dev/null || die "Apple 'container' CLI not found"
 command -v python3 >/dev/null || die "python3 is required"
@@ -77,10 +78,14 @@ trap 'rm -rf "$WORK"' EXIT
 
 # --- small JSON / OCI-layout helpers ---------------------------------------------------
 cat >"$WORK/cnb.py" <<'PY'
-import io, json, os, shutil, sys, tarfile
+import io, json, os, re, shutil, sys, tarfile
 
 INDEX_TYPES = {"application/vnd.oci.image.index.v1+json",
                "application/vnd.docker.distribution.manifest.list.v2+json"}
+# <repository> and <tag> grammar of the OCI distribution spec (what the lifecycle accepts).
+REPO_RE = re.compile(r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+                     r"(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*$")
+TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 
 def ref(name):
     """Normalise an image reference the way the lifecycle (go-containerregistry) does.
@@ -94,6 +99,8 @@ def ref(name):
     registry = "docker.io"
     if rest and ("." in first or ":" in first or first == "localhost"):
         registry, repo = first, rest
+    if not REPO_RE.match(repo) or not TAG_RE.match(tag):
+        sys.exit(f"invalid image reference: {name}")
     if registry in ("docker.io", "index.docker.io"):
         registry = "docker.io"
         if "/" not in repo:
@@ -127,6 +134,28 @@ def builder_info(platform):
 
 def image_id():
     print(json.load(sys.stdin)[0]["id"])
+
+def blob_path(root, digest):
+    algo, hexd = digest.split(":", 1)
+    return os.path.join(root, "blobs", algo, hexd)
+
+def referenced(root, desc):
+    """Digests an image manifest descriptor keeps alive: itself, its config and its layers.
+    Fails if any of them is missing from <root>/blobs."""
+    with open(blob_path(root, desc["digest"])) as f:
+        manifest = json.load(f)
+    keep = {desc["digest"], manifest["config"]["digest"]} | {l["digest"] for l in manifest["layers"]}
+    missing = sorted(d for d in keep if not os.path.isfile(blob_path(root, d)))
+    if missing:
+        sys.exit(f"{root} is missing blobs: {', '.join(missing)}")
+    return keep
+
+def prune(root, keep):
+    """Deletes every blob below <root>/blobs whose digest is not in `keep`."""
+    for algo in os.listdir(os.path.join(root, "blobs")):
+        for hexd in os.listdir(os.path.join(root, "blobs", algo)):
+            if f"{algo}:{hexd}" not in keep:
+                os.remove(os.path.join(root, "blobs", algo, hexd))
 
 def flatten(src_tar, dest, platform):
     """`container image save` output -> single-manifest OCI layout, which is what the
@@ -163,6 +192,7 @@ def flatten(src_tar, dest, platform):
     with open(os.path.join(tmp, "index.json"), "w") as f:
         json.dump({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
                    "manifests": [desc]}, f)
+    prune(tmp, referenced(tmp, desc))  # drop the other platforms' manifests and layers
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     os.rename(tmp, dest)
@@ -178,16 +208,7 @@ def package(layout, full_ref, out):
     ann = desc.setdefault("annotations", {})
     ann["org.opencontainers.image.ref.name"] = full_ref
     ann["io.containerd.image.name"] = full_ref
-    def path(digest):
-        algo, hexd = digest.split(":", 1)
-        return os.path.join(layout, "blobs", algo, hexd)
-    with open(path(desc["digest"])) as f:
-        manifest = json.load(f)
-    keep = {desc["digest"], manifest["config"]["digest"]} | {l["digest"] for l in manifest["layers"]}
-    for algo in os.listdir(os.path.join(layout, "blobs")):
-        for hexd in os.listdir(os.path.join(layout, "blobs", algo)):
-            if f"{algo}:{hexd}" not in keep:
-                os.remove(os.path.join(layout, "blobs", algo, hexd))
+    prune(layout, referenced(layout, desc))
     data = json.dumps(index).encode()
     with tarfile.open(out, "w") as tar:
         tar.add(os.path.join(layout, "oci-layout"), "oci-layout")
@@ -239,7 +260,9 @@ if [[ ! -f $LAYOUT_ROOT/$RUN_LAYOUT/index.json || "$(cat "$STAMP" 2>/dev/null)" 
 fi
 
 # --- 3. build cache volume ------------------------------------------------------------
-VOLUME="cnb-cache-$(printf '%s' "${IMAGE_REF#docker.io/library/}-$ARCH" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | cut -c1-80)"
+# ASCII-only volume name: lower-case, every other byte becomes '-', at most 80 characters.
+VOLUME="cnb-cache-$(printf '%s' "${IMAGE_REF#docker.io/library/}-$ARCH" \
+  | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c '[:lower:][:digit:]' '-' | cut -c1-80)"
 if $CLEAR_CACHE; then
   container volume rm "$VOLUME" >/dev/null 2>&1 || true
 fi
@@ -252,6 +275,7 @@ for kv in ${BUILD_ENV[@]+"${BUILD_ENV[@]}"}; do ENV_ARGS+=(-e "CNB_BUILD_ENV__$k
 # Runs as root inside the builder: copy the source (pack does the same, so buildpacks
 # that delete source files never touch your checkout), write the build env files, then
 # hand over to the creator, which chowns its dirs and drops to the CNB user itself.
+# shellcheck disable=SC2016  # single quotes on purpose: the expansions happen in the container
 INNER='set -euo pipefail
 mkdir -p /workspace /platform/env
 cp -a /src/. /workspace/
@@ -271,6 +295,7 @@ container run --rm --progress none --platform "$PLATFORM" -u 0:0 -c "$CPUS" -m "
   -v "$LAYOUT_ROOT:/layout-repo" \
   -v "$VOLUME:/cache" \
   -e "CNB_PLATFORM_API=$PLATFORM_API" -e CNB_EXPERIMENTAL_MODE=warn \
+  -e "CNB_USER_ID=$CNB_UID" -e "CNB_GROUP_ID=$CNB_GID" \
   -e "CNB_RUN_REF=$RUN_REF" -e "CNB_OUT_REF=$IMAGE_REF" -e "CNB_LOG_LEVEL=$LOG_LEVEL" \
   ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
   "$BUILDER" bash -c "$INNER"

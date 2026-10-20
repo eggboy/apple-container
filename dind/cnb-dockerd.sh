@@ -38,18 +38,28 @@ usage() { awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' 
 api() { curl -fsS --unix-socket "$SOCK" "http://localhost$1" "${@:2}"; }
 reachable() { api /_ping --max-time 3 >/dev/null 2>&1; }
 
+need_tools() {
+  command -v container >/dev/null || die "Apple 'container' CLI not found"
+  command -v python3 >/dev/null || die "python3 is required"
+}
+
+# Prints absent | running | stopped, from `.[0].status.state` of `container inspect`.
 state() {
   local json
   json=$(container inspect "$NAME" 2>/dev/null) || { echo absent; return; }
-  if grep -Eq '"state" *: *"running"' <<<"$json"; then echo running; else echo stopped; fi
+  python3 -c 'import json, sys
+d = json.load(sys.stdin)
+print("running" if d and d[0].get("status", {}).get("state") == "running" else "stopped")' <<<"$json"
 }
 
 cmd_start() {
-  command -v container >/dev/null || die "Apple 'container' CLI not found"
+  need_tools
   case "$(state)" in
     running) ;;
     absent)
       mkdir -p "$(dirname "$SOCK")"
+      # The runtime unlinks a stale host socket before binding and removes it on stop;
+      # this is belt and braces for a leftover file from an older engine or a crash.
       rm -f "$SOCK"
       container volume inspect "$VOLUME" >/dev/null 2>&1 || container volume create "$VOLUME" >/dev/null
       # --cap-add ALL + no masked/read-only /proc and /sys paths ~= `docker run --privileged`,
@@ -67,13 +77,12 @@ cmd_start() {
         --feature containerd-snapshotter=false >/dev/null
       ;;
     *)
-      rm -f "$SOCK"
+      rm -f "$SOCK"  # same belt and braces as above
       local out
       out=$(container start "$NAME" 2>&1) || { printf '%s\n' "$out" >&2; die "could not start $NAME"; }
       ;;
   esac
-  local i
-  for i in $(seq 1 60); do reachable && break; sleep 1; done
+  for _ in $(seq 1 60); do reachable && break; sleep 1; done
   reachable || die "engine not reachable at $SOCK (see: container logs $NAME)"
   echo "Docker Engine is ready. Point pack at it with:"
   echo "  export DOCKER_HOST=unix://$SOCK"
@@ -99,6 +108,7 @@ cmd_load() {
 }
 
 cmd_status() {
+  need_tools
   echo "container '$NAME': $(state)"
   if reachable; then echo "engine: reachable at unix://$SOCK"; else echo "engine: not reachable"; fi
 }

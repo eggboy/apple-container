@@ -35,7 +35,7 @@ Cloud Native Buildpacks builds do work **using only Apple `container`, with no D
 | Bind mounts for app source | ⚠️ | Files show as `root`-owned and `chown` does nothing, so the source is **copied** into the build container (as `pack` does). This also stops `google.java.clear-source` from deleting files in your checkout. |
 | `container machine` | ⚠️ possible, not needed | Could host `dockerd`, but `machine create` has no socket or port publishing options, so you'd need unauthenticated TCP. Option A is simpler. |
 | `container build` (BuildKit + Dockerfile) | ⚠️ not pursued | Could run detect/build inside a Dockerfile, but it skips the CNB exporter (no proper layers, labels, SBOM or rebase). |
-| Third-party Docker-API shims (e.g. socktainer) | not evaluated | Not part of Apple container; the GitHub check was declined; |
+| Third-party Docker-API shims (e.g. socktainer) | not evaluated | Not part of Apple container; the GitHub check was declined. |
 | Running the result | ✅ needs `--arch amd64` | Without it: `Error: platform linux/arm64`, because the image is amd64-only like its builder. |
 
 ## Option A: `pack` unchanged ([cnb-dockerd.sh](cnb-dockerd.sh))
@@ -78,6 +78,9 @@ What it does:
 > Option B relies on the lifecycle's experimental "export to OCI layout" feature (`CNB_EXPERIMENTAL_MODE=warn`). It worked with lifecycle 0.21.23 / platform API 0.15, but it isn't a stable contract like `pack` + Docker API.
 
 ## Your machine right now
+
+This section and the Environment line at the top are a snapshot of the machine and session that produced this report (macOS 26.7.1, `container` 1.5.0). They do not describe any other machine.
+
 - Images in Apple container: `sample-mvn:latest` (built by Option B), plus `gcr.io/buildpacks/builder`, `gcr.io/buildpacks/google-24/run` and `docker:dind`.
 - Option A engine: container `cnb-dockerd` (stopped), volume `cnb-docker-data` (holds the builder and the pack-built `sample-mvn`), socket path `~/.cnb-dockerd/docker.sock`.
 - Option B build cache: volume `cnb-cache-sample-mvn-latest-amd64`. Layouts go to `~/.cache/cnb-container` on first use.
