@@ -76,11 +76,3 @@ What it does:
 
 > [!WARNING]
 > Option B relies on the lifecycle's experimental "export to OCI layout" feature (`CNB_EXPERIMENTAL_MODE=warn`). It worked with lifecycle 0.21.23 / platform API 0.15, but it isn't a stable contract like `pack` + Docker API.
-
-## Your machine right now
-
-This section and the Environment line at the top are a snapshot of the machine and session that produced this report (macOS 26.7.1, `container` 1.5.0). They do not describe any other machine.
-
-- Images in Apple container: `sample-mvn:latest` (built by Option B), plus `gcr.io/buildpacks/builder`, `gcr.io/buildpacks/google-24/run` and `docker:dind`.
-- Option A engine: container `cnb-dockerd` (stopped), volume `cnb-docker-data` (holds the builder and the pack-built `sample-mvn`), socket path `~/.cnb-dockerd/docker.sock`.
-- Option B build cache: volume `cnb-cache-sample-mvn-latest-amd64`. Layouts go to `~/.cache/cnb-container` on first use.
